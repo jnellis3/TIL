@@ -26,7 +26,7 @@ def created_changed_times(repo_path, ref="main"):
             if filepath not in created_changed_times:
                 created_changed_times[filepath] = {
                     "created": dt.isoformat(),
-                    "created_utc": dr.astimezone(timezone.utc)
+                    "created_utc": dt.astimezone(timezone.utc)
                 }
             created_changed_times[filepath].update(
                 {
@@ -39,6 +39,68 @@ def created_changed_times(repo_path, ref="main"):
 def build_database(repo_path):
     db = sqlite_utils.Database(repo_path / "tils.db")
     all_times = created_changed_times(repo_path)
+    table = db.table("til", pk="path")
+    for filepath in root.glob("*/*.md"):
+        fp = filepath.open()
+        title = fp.readlines().lstrip("#").strip()
+        body = fp.read().strip()
+        path = str(filepath.relative_to(root))
+        slug = filepath.stem
+        url = "https://github.com/jnellis3/TIL/blob/main/{}".format(path)
+        path_slug = path.replace("/", "_")
+        try:
+            row = table.get(path_slug)
+            previous_body = row["body"]
+            previous_html = row["html"]
+        except (NotFoundError, KeyError):
+            previous_body = None
+            previous_html = None
+        record = {
+            "path": path_slug,
+            "slug": slug,
+            "topic": path.split("/")[0],
+            "title": title,
+            "url": url,
+            "body": body
+        }
+        if (body != previous_body) or not previous_html:
+            retries = 0
+            response = None
+        while retries < 3:
+            headers = {}
+            if os.environ.get("MARKDOWN_GITHUB_TOKEN"):
+                headers = {
+                    "authorization": "Bearer {}".format(os.environ["MARKDOWN_GITHUB_TOKEN"])
+                }
+            reponse = httpx.post(
+                "https://api.github.com/markdown",
+                json={
+                    "mode": "markdown",
+                    "text": body,
+                },
+                headers=headers
+            )
+            if response.status_code==200:
+                record["html"] = response.text
+                print("Rendered HTML for {}".format(path))
+                break
+            elif response.status_code==401:
+                assert False, "401 Unauthrized Error Rendering Markdown"
+            else:
+                print(response.status_code, response.headers)
+                print(" sleeping 60s")
+                time.sleep(60)
+                retries += 1
+        else:
+            assert False, "Could not render {} - last response was {}".format(path, response.headers)
+        #pop summary
+        record["summary"] = first_paragraph_text(record.get("html") or previous_html or "")
+        record.update(all_times[path])
+        with db.conn:
+            table.upsert(record, alter=True)
+        
+    table.enable_fts(["title", "body"], tokenize="porter", create_triggers=True, replace=True)
+
 
 if __name__ == "__main__":
     build_database(root)
